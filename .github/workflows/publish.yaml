@@ -1,0 +1,86 @@
+# Moduł tf-naming: testy i paczka przy każdym push/PR, publikacja w ghcr.io po tagu vX.Y.Z
+name: build-and-publish
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TOFU_VERSION: 1.12.x
+
+jobs:
+  build:
+    name: Testy i paczka modułu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+
+      - name: Formatowanie i walidacja
+        run: |
+          tofu fmt -check -recursive
+          tofu init -backend=false -input=false
+          tofu validate
+
+      - name: Testy konwencji nazw (tests/*.tftest.hcl)
+        run: tofu test
+
+      # Paczka: zip z plikami modułu w katalogu głównym, bez testów i plików roboczych
+      - name: Budowa paczki
+        run: |
+          zip -qr module.zip . \
+            -x '.git/*' '.github/*' '.terraform/*' '.terraform.lock.hcl' '*.tfstate*' 'tests/*'
+          unzip -l module.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: module.zip
+          retention-days: 7
+
+  publish:
+    name: Publikacja w ghcr.io
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # GitHub Release
+      packages: write # push do ghcr.io tokenem GITHUB_TOKEN
+    env:
+      REPO: ghcr.io/${{ github.repository_owner }}/tf-naming
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: module-zip
+
+      - uses: oras-project/setup-oras@v1
+
+      # Artefakt OCI o typie modułu OpenTofu: jedna warstwa archive/zip
+      - name: oras push
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+          oras push "${REPO,,}:${TAG}" \
+            --artifact-type application/vnd.opentofu.modulepkg \
+            --annotation "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}" \
+            --annotation "org.opencontainers.image.version=${TAG}" \
+            module.zip:archive/zip
+
+      - name: GitHub Release z paczką
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${TAG}" module.zip \
+            --repo "${{ github.repository }}" \
+            --title "tf-naming ${TAG}" \
+            --notes "source = \"oci://${REPO,,}?tag=${TAG}\""
